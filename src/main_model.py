@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diff_models import diff_CSDI
-
+from loguru import logger
 
 class CSDI_base(nn.Module):
     """
@@ -69,7 +69,7 @@ class CSDI_base(nn.Module):
         self.alpha = np.cumprod(self.alpha_hat)
         # shape (num_steps, 1, 1) for broadcasting over (B, F, L)
         self.alpha_torch = (
-            torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
+            torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1).unsqueeze(1)
         )
 
     # ------------------------------------------------------------------
@@ -115,12 +115,15 @@ class CSDI_base(nn.Module):
         """
         pos: (B, L) float
         returns: (B, L, d_model)
+        d_model должен быть чётным (sin/cos пары).
         """
+        assert d_model % 2 == 0, f"timeemb must be even, got {d_model}"
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model, device=self.device)
         position = pos.unsqueeze(2)  # (B, L, 1)
+        half = d_model // 2
         div_term = 1.0 / torch.pow(
             10000.0,
-            torch.arange(0, d_model, 2, device=self.device) / d_model,
+            torch.arange(0, half, device=self.device).float() / d_model,
         )
         pe[:, :, 0::2] = torch.sin(position * div_term)
         pe[:, :, 1::2] = torch.cos(position * div_term)
@@ -144,7 +147,6 @@ class CSDI_base(nn.Module):
 
         side_info = torch.cat([time_embed, feature_embed], dim=-1)  # (B, L, F, emb_total)
         side_info = side_info.permute(0, 3, 2, 1)                   # (B, emb_total, F, L)
-        side_info = (side_info - side_info.mean()) / (side_info.std() + 1e-8)
 
         if not self.is_unconditional:
             # cond_mask: (B, 1, F, L) -- 1=known, 0=hole
@@ -173,7 +175,7 @@ class CSDI_base(nn.Module):
             return noisy_data  # (B, 2, F, L)
         else:
             cond_obs     = cond_mask * observed_data   # (B, 2, F, L)  holes=0
-            noisy_target = noisy_data                  # (B, 2, F, L)  full noisy
+            noisy_target = noisy_data * (1 - cond_mask)                  # (B, 2, F, L)  full noisy
             return torch.cat([cond_obs, noisy_target], dim=1)  # (B, 4, F, L)
 
     # ------------------------------------------------------------------
@@ -210,21 +212,96 @@ class CSDI_base(nn.Module):
         total_input = self.set_input_to_diffmodel(noisy_clean, observed_data, cond_mask)
         predicted   = self.diffmodel(total_input, side_info, t)  # (B, 2, F, L)
 
-        # Loss только на реальных дырках: observed_mask=1 но cond_mask=0
-        target_mask = (observed_mask - cond_mask).expand_as(noise)  # (B, 2, F, L)
-        residual    = (noise - predicted) * target_mask
-        num_eval    = target_mask.sum()
-        loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        # Loss на всех позициях скрытых от модели:
+        # — реальные дырки (0 в observed_mask)
+        # — позиции дополнительно скрытые hist_mask (1 в observed_mask, 0 в cond_mask)
+        target_mask = (1.0 - cond_mask).expand_as(noise)
+        num_eval = target_mask.sum()
+        if num_eval == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        # residual = (noise - predicted) * target_mask
+        # loss = (residual ** 2).sum() / num_eval
+
+
+
+        eps_loss = ((noise - predicted) ** 2 * target_mask).sum() / target_mask.sum()
+        x0_hat = (
+            noisy_clean - (1.0 - current_alpha).sqrt() * predicted
+        ) / current_alpha.sqrt()
+        x0_loss = (torch.abs(x0_hat - clean_data) * target_mask).sum() / target_mask.sum()
+        # loss = eps_loss + 0.5 * x0_loss
+
+        hole = (1.0 - cond_mask).expand_as(x0_hat)
+
+        # l1 = (torch.abs(x0_hat - clean_data) * hole).sum() / hole.sum()
+
+        # dt = torch.abs(x0_hat[:, :, :, 1:] - x0_hat[:, :, :, :-1])
+        # df = torch.abs(x0_hat[:, :, 1:, :] - x0_hat[:, :, :-1, :])
+
+        # hole_t = hole[:, :, :, 1:] * hole[:, :, :, :-1]
+        # hole_f = hole[:, :, 1:, :] * hole[:, :, :-1, :]
+
+        # tv_t = (dt * hole_t).sum() / (hole_t.sum() + 1e-8)
+        # tv_f = (df * hole_f).sum() / (hole_f.sum() + 1e-8)
+
+        # loss = eps_loss+0.1* x0_loss+0.001 *(tv_t + tv_f)
+
+
+        hat_vals = x0_hat[hole > 0]
+        clean_vals = clean_data[hole > 0]
+
+        std_loss = torch.abs(hat_vals.std() - clean_vals.std())
+        mean_abs_loss = torch.abs(hat_vals.abs().mean() - clean_vals.abs().mean())
+
+        loss = eps_loss + 0.01 * x0_loss + 0.01 * std_loss + 0.01 * mean_abs_loss
+
         return loss
 
+    def debug_x0_hat(self, batch, t_value=50):
+        """
+        Диагностика: один denoising step без полного reverse diffusion.
+        Возвращает:
+        recon_direct: observed_data в known + x0_hat в holes
+        x0_hat: оценка clean_data из одного шага
+        clean_data, observed_data, cond_mask
+        """
+        self.eval()
+
+        observed_data, clean_data, observed_mask, observed_tp, gt_mask, for_pattern_mask = self.process_data(batch)
+
+        # Для sanity check строго те же дырки, что в данных
+        cond_mask = observed_mask
+        side_info = self.get_side_info(observed_tp, cond_mask)
+
+        B = clean_data.shape[0]
+        t = torch.full((B,), t_value, device=self.device, dtype=torch.long)
+
+        current_alpha = self.alpha_torch[t]  # (B, 1, 1, 1)
+
+        noise = torch.randn_like(clean_data)
+        x_t = current_alpha.sqrt() * clean_data + (1.0 - current_alpha).sqrt() * noise
+
+        total_input = self.set_input_to_diffmodel(x_t, observed_data, cond_mask)
+        eps_pred = self.diffmodel(total_input, side_info, t)
+
+        # x0_hat = (x_t - sqrt(1-alpha_t) * eps_pred) / sqrt(alpha_t)
+        x0_hat = (x_t - (1.0 - current_alpha).sqrt() * eps_pred) / current_alpha.sqrt()
+
+        # Склеиваем known из observed_data, holes из x0_hat
+        recon_direct = cond_mask * observed_data + (1.0 - cond_mask) * x0_hat
+
+        return recon_direct.detach(), x0_hat.detach(), clean_data.detach(), observed_data.detach(), cond_mask.detach()
+
     def calc_loss_valid(self, observed_data, clean_data, cond_mask, observed_mask, side_info, is_train):
+        # Оцениваем на небольшом подмножестве шагов — полный перебор 100 шагов слишком дорог
+        eval_steps = np.linspace(0, self.num_steps - 1, num=10, dtype=int)
         loss_sum = 0.0
-        for t in range(self.num_steps):
+        for t in eval_steps:
             loss = self.calc_loss(
                 observed_data, clean_data, cond_mask, observed_mask, side_info, is_train, set_t=t
             )
             loss_sum += loss.detach()
-        return loss_sum / self.num_steps
+        return loss_sum / len(eval_steps)
 
     # ------------------------------------------------------------------
     # Reverse diffusion sampling
@@ -257,7 +334,6 @@ class CSDI_base(nn.Module):
 
             # start from pure noise
             current_sample = torch.randn_like(observed_data)  # (B, 2, F, L)
-
             for t in range(self.num_steps - 1, -1, -1):
                 if self.is_unconditional:
                     diff_input = (
@@ -283,6 +359,8 @@ class CSDI_base(nn.Module):
                     ) ** 0.5
                     current_sample = current_sample + sigma * torch.randn_like(current_sample)
 
+                current_sample = current_sample.clamp(-1.5,1.5)
+
                 # replacement trick: paste known values back at every step
                 # this enforces the conditioning and prevents drift
                 current_sample = (
@@ -297,22 +375,48 @@ class CSDI_base(nn.Module):
     # ------------------------------------------------------------------
     # forward / evaluate
     # ------------------------------------------------------------------
+    def calc_loss_valid_real_holes(self, observed_data, clean_data, cond_mask, observed_mask, side_info):
+        loss_sum = 0.0
+        for t in range(self.num_steps):
+            B = clean_data.shape[0]
+            tt = (torch.ones(B) * t).long().to(self.device)
 
+            current_alpha = self.alpha_torch[tt]
+            noise = torch.randn_like(clean_data)
+            noisy_clean = current_alpha ** 0.5 * clean_data + (1.0 - current_alpha) ** 0.5 * noise
+
+            total_input = self.set_input_to_diffmodel(noisy_clean, observed_data, cond_mask)
+            predicted = self.diffmodel(total_input, side_info, tt)
+
+            target_mask = (1.0 - observed_mask).expand_as(noise)
+            residual = (noise - predicted) * target_mask
+            num_eval = target_mask.sum()
+            loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+            loss_sum += loss.detach()
+
+        return loss_sum / self.num_steps
     def forward(self, batch, is_train=1):
         observed_data, clean_data, observed_mask, observed_tp, gt_mask, for_pattern_mask = self.process_data(batch)
-
-        if is_train == 0:
-            cond_mask = gt_mask
-        elif self.target_strategy != "random":
-            cond_mask = self.get_hist_mask(observed_mask, for_pattern_mask=for_pattern_mask)
-        else:
-            cond_mask = self.get_randmask(observed_mask)
+        cond_mask = observed_mask
+        # if is_train == 0:
+        #     cond_mask = observed_mask
+        # elif self.target_strategy != "random":
+        #     cond_mask = self.get_hist_mask(observed_mask, for_pattern_mask=for_pattern_mask)
+        # else:
+        #     cond_mask = self.get_randmask(observed_mask)
 
         side_info = self.get_side_info(observed_tp, cond_mask)
-        loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
-        return loss_func(observed_data, clean_data, cond_mask, observed_mask, side_info, is_train)
 
-    def evaluate(self, batch, n_samples):
+        if is_train == 0:
+            return self.calc_loss_valid_real_holes(
+                observed_data, clean_data, cond_mask, observed_mask, side_info
+            )
+        else:
+            return self.calc_loss(
+                observed_data, clean_data, cond_mask, observed_mask, side_info, is_train
+            )
+
+    def evaluate(self, batch, nsample):
         """
         returns:
             samples       : (B, n_samples, 2, F, L)
@@ -327,7 +431,7 @@ class CSDI_base(nn.Module):
             cond_mask   = observed_mask          # условие = все известные позиции
             target_mask = 1.0 - observed_mask    # 1 в дырках
             side_info   = self.get_side_info(observed_tp, cond_mask)
-            samples     = self.impute(observed_data, cond_mask, side_info, n_samples)
+            samples     = self.impute(observed_data, cond_mask, side_info, nsample)
 
         return samples, observed_data, target_mask, observed_mask, observed_tp
 
@@ -357,7 +461,7 @@ class CSDI_Physio(CSDI_base):
         observed_tp   = batch["timepoints"].to(self.device).float()       # (N,) or (B, N)
 
         if observed_tp.dim() == 1:
-            observed_tp = observed_tp.unsqueeze(0).expand(observed_data.shape[0], -1)
+            observed_tp = observed_tp.unsqueeze(0).expand(observed_data.shape[0], -1).clone()
 
         for_pattern_mask = observed_mask
         return observed_data, clean_data, observed_mask, observed_tp, gt_mask, for_pattern_mask

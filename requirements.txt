@@ -1,0 +1,12 @@
+torch
+pandas
+numpy
+tqdm
+pyyaml
+matplotlib
+wget
+linear_attention_transformer
+soundfile
+loguru
+torchmetrics
+pesq

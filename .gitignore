@@ -1,0 +1,23 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Local datasets and generated experiment artifacts
+train/
+data/
+save/
+*.pth
+*.pt
+*.ckpt
+*.wav
+
+# Generated diagnostics
+debug_visualization.png
+imputation_quality.png
+mask_diagnosis.png
+metrics_distribution.png
+

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as FF
 import math
 from linear_attention_transformer import LinearAttentionTransformer  # type: ignore
 
@@ -17,12 +17,12 @@ def get_torch_trans(heads=8, layers=1, channels=64):
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
 
-def get_linear_trans(heads=8, layers=1, channels=64):
+def get_linear_trans(heads=8, layers=1, channels=64, max_seq_len=512):
     return LinearAttentionTransformer(
         dim=channels,
         depth=layers,
         heads=heads,
-        max_seq_len=256,
+        max_seq_len=max_seq_len,
         n_local_attn_heads=0,
         local_attn_window_size=0,
     )
@@ -53,8 +53,8 @@ class DiffusionEmbedding(nn.Module):
 
     def forward(self, diffusion_step):
         x = self.embedding[diffusion_step]  # (B, embedding_dim)
-        x = F.silu(self.projection1(x))
-        x = F.silu(self.projection2(x))
+        x = FF.silu(self.projection1(x))
+        x = FF.silu(self.projection2(x))
         return x
 
     def _build_embedding(self, num_steps, dim=64):
@@ -107,6 +107,10 @@ class diff_CSDI(nn.Module):
                     diffusion_embedding_dim=config["diffusion_embedding_dim"],
                     nheads=config["nheads"],
                     is_linear=config["is_linear"],
+                    # max_seq_len_time = L кадров, max_seq_len_freq = F бинов
+                    # берём из конфига, дефолты с запасом если не указаны
+                    max_seq_len_time=config.get("max_seq_len_time", 512),
+                    max_seq_len_freq=config.get("max_seq_len_freq", 257),
                 )
                 for _ in range(config["layers"])
             ]
@@ -124,7 +128,7 @@ class diff_CSDI(nn.Module):
 
         # Flatten F×L для Conv1d
         x = x.reshape(B, inputdim, F * L)
-        x = F.relu(self.input_projection(x))          # (B, channels, F*L)
+        x = FF.silu(self.input_projection(x))          # SiLU сохраняет отрицательные Re/Im значения
         x = x.reshape(B, self.channels, F, L)
 
         diffusion_emb = self.diffusion_embedding(diffusion_step)  # (B, diff_emb_dim)
@@ -139,7 +143,7 @@ class diff_CSDI(nn.Module):
         # (B, channels, F, L)
 
         x = x.reshape(B, self.channels, F * L)
-        x = F.relu(self.output_projection1(x))        # (B, channels, F*L)
+        x = FF.relu(self.output_projection1(x))        # (B, channels, F*L)
         x = self.output_projection2(x)                 # (B, 2, F*L)
         x = x.reshape(B, 2, F, L)
         return x
@@ -150,7 +154,8 @@ class diff_CSDI(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ResidualBlock(nn.Module):
-    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False):
+    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads,
+                 is_linear=False, max_seq_len_time=500, max_seq_len_freq=257):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         self.cond_projection      = Conv1d_with_init(side_dim, 2 * channels, 1)
@@ -159,8 +164,12 @@ class ResidualBlock(nn.Module):
 
         self.is_linear = is_linear
         if is_linear:
-            self.time_layer    = get_linear_trans(heads=nheads, layers=1, channels=channels)
-            self.feature_layer = get_linear_trans(heads=nheads, layers=1, channels=channels)
+            # time_layer обрабатывает последовательности длиной L (временные кадры)
+            # feature_layer обрабатывает последовательности длиной F (частоты)
+            self.time_layer    = get_linear_trans(heads=nheads, layers=1, channels=channels,
+                                                  max_seq_len=max_seq_len_time)
+            self.feature_layer = get_linear_trans(heads=nheads, layers=1, channels=channels,
+                                                  max_seq_len=max_seq_len_freq)
         else:
             self.time_layer    = get_torch_trans(heads=nheads, layers=1, channels=channels)
             self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
