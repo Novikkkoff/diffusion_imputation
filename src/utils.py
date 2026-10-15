@@ -196,6 +196,7 @@ def evaluate_one_item_metrics(
         n_fft=n_fft,
         hop_length=hop_length,
         win_length=win_length,
+        match_hole_energy=True,
     )
 
     clean_wav = batch["clean_wav"][i].cpu()
@@ -640,6 +641,12 @@ def evaluate(
     pesq_lossy_n     = 0
     n_audio          = 0
 
+    hole_sqerr_recon = 0.0
+    hole_sqerr_lossy = 0.0
+    hole_abserr_recon = 0.0
+    hole_abserr_lossy = 0.0
+    hole_sample_count = 0
+
     dnsmos_clean_sum = 0.0
     dnsmos_lossy_sum = 0.0
     dnsmos_recon_sum = 0.0
@@ -710,6 +717,21 @@ def evaluate(
                             pesq_lossy_sum += pq_lossy
                             pesq_lossy_n   += 1
 
+                        if "time_mask" in test_batch:
+                            time_mask = test_batch["time_mask"][i].cpu()[:T2]
+                            hole = time_mask < 0.5
+                            if hole.any():
+                                clean_hole = clean_[:T2][hole]
+                                recon_hole = recon_[:T2][hole]
+                                lossy_hole = lossy_wav[:T2][hole]
+                                recon_err = recon_hole - clean_hole
+                                lossy_err = lossy_hole - clean_hole
+                                hole_sqerr_recon += float((recon_err ** 2).sum().item())
+                                hole_sqerr_lossy += float((lossy_err ** 2).sum().item())
+                                hole_abserr_recon += float(recon_err.abs().sum().item())
+                                hole_abserr_lossy += float(lossy_err.abs().sum().item())
+                                hole_sample_count += int(hole.sum().item())
+
                     if dnsmos_metric is not None:
                         try:
                             dnsmos_recon_sum += dnsmos_score_one(dnsmos_metric, recon_)
@@ -761,10 +783,28 @@ def evaluate(
         print(f"  DNSMOS(recon):   {dnsmos_recon_sum / dnsmos_n:.3f}")
         print(f"  ΔDNSMOS:         {(dnsmos_recon_sum - dnsmos_lossy_sum) / dnsmos_n:+.3f}")
 
+    if hole_sample_count > 0:
+        hole_rmse_recon = (hole_sqerr_recon / hole_sample_count) ** 0.5
+        hole_rmse_lossy = (hole_sqerr_lossy / hole_sample_count) ** 0.5
+        hole_mae_recon = hole_abserr_recon / hole_sample_count
+        hole_mae_lossy = hole_abserr_lossy / hole_sample_count
+        print(f"  Hole RMSE recon: {hole_rmse_recon:.6f}")
+        print(f"  Hole RMSE lossy: {hole_rmse_lossy:.6f}")
+        print(f"  Hole MAE recon:  {hole_mae_recon:.6f}")
+        print(f"  Hole MAE lossy:  {hole_mae_lossy:.6f}")
+    else:
+        hole_rmse_recon = hole_rmse_lossy = 0.0
+        hole_mae_recon = hole_mae_lossy = 0.0
+
     return {
         "si_sdr": si_sdr_sum / max(n_audio, 1),
         "pesq_recon": pesq_recon_sum / max(pesq_recon_n, 1),
         "pesq_lossy": pesq_lossy_sum / max(pesq_lossy_n, 1),
         "dnsmos_recon": dnsmos_recon_sum / max(dnsmos_n, 1),
+        "hole_rmse_recon": hole_rmse_recon,
+        "hole_rmse_lossy": hole_rmse_lossy,
+        "hole_mae_recon": hole_mae_recon,
+        "hole_mae_lossy": hole_mae_lossy,
+        "hole_sample_count": hole_sample_count,
         "n_audio": n_audio,
     }

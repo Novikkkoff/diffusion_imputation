@@ -43,11 +43,23 @@ train/lossy_signals/<item_id>.wav
 train/traces/<item_id>_is_lost.txt
 ```
 
-Before running, update the dataset paths in `src/exe_audio.py`. The current
-defaults point to the original CUDA training server.
+By default the entry point reads the three dataset directories from `train/`
+next to the source tree. Different locations can be passed explicitly with
+`--clean_dir`, `--lossy_dir`, and `--traces_dir`.
 
 ```bash
 python src/exe_audio.py --device cuda:0 --config base.yaml
+```
+
+Evaluation can load either a checkpoint file or an experiment directory. New
+experiments store the STFT normalization value in `config.json`, so inference
+uses the same preprocessing as training.
+
+```bash
+python src/exe_audio.py \
+  --device cuda:0 \
+  --eval_only \
+  --checkpoint save/audio_fold0_YYYYMMDD_HHMMSS/model_best.pth
 ```
 
 To run an overfit diagnostic on selected items:
@@ -59,10 +71,11 @@ python src/exe_audio.py --device cuda:0 --item_id 140535,2106,209055
 ## Project status
 
 The model can learn to reconstruct packet-loss regions in one-item and
-small-subset overfit experiments. The next milestone is a reproducible
-held-out evaluation: separate the training and validation loaders, persist
-normalization metadata with checkpoints, remove hard-coded paths, and report
-metrics on a fixed test split.
+small-subset overfit experiments. The pipeline now uses a held-out validation
+loader by default, persists normalization metadata, records evaluation metrics
+as JSON, and reports RMSE/MAE specifically inside packet-loss regions. The next
+milestone is a controlled baseline experiment on a fixed train/valid/test
+split.
 
 Generated datasets, checkpoints, WAV files, and experiment folders are
 excluded by `.gitignore`.

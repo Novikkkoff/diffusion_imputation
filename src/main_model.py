@@ -167,15 +167,15 @@ class CSDI_base(nn.Module):
 
         For conditional mode we give the model two paired channel groups:
             channels 0-1: cond_obs     = known part of lossy (holes stay 0)
-            channels 2-3: noisy_target = x_t everywhere
-        The model learns to predict noise at ALL positions, but loss is
-        computed only at hole positions (target_mask in calc_loss).
+            channels 2-3: noisy_target = x_t only inside holes
+        The loss is computed only at hole positions (target_mask in
+        calc_loss), and sampling uses this same input construction.
         """
         if self.is_unconditional:
             return noisy_data  # (B, 2, F, L)
         else:
             cond_obs     = cond_mask * observed_data   # (B, 2, F, L)  holes=0
-            noisy_target = noisy_data * (1 - cond_mask)                  # (B, 2, F, L)  full noisy
+            noisy_target = noisy_data * (1 - cond_mask)  # (B, 2, F, L), holes only
             return torch.cat([cond_obs, noisy_target], dim=1)  # (B, 4, F, L)
 
     # ------------------------------------------------------------------
@@ -341,12 +341,17 @@ class CSDI_base(nn.Module):
                         + (1.0 - cond_mask) * current_sample
                     )
                 else:
-                    cond_obs     = cond_mask * observed_data
-                    noisy_target = current_sample
-                    diff_input   = torch.cat([cond_obs, noisy_target], dim=1)  # (B, 4, F, L)
+                    # Use exactly the same input construction as during training:
+                    # known positions are supplied only through the conditioning
+                    # channels, while the noisy target channels contain holes only.
+                    diff_input = self.set_input_to_diffmodel(
+                        current_sample, observed_data, cond_mask
+                    )
 
                 predicted = self.diffmodel(
-                    diff_input, side_info, torch.tensor([t], device=self.device)
+                    diff_input,
+                    side_info,
+                    torch.full((B,), t, device=self.device, dtype=torch.long),
                 )  # (B, 2, F, L)
 
                 coeff1 = 1.0 / self.alpha_hat[t] ** 0.5

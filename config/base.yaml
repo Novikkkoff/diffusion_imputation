@@ -14,7 +14,7 @@ diffusion:
   num_steps: 100
   schedule: "linear"
   is_linear: True           # O(n) LinearAttention — обязательно, иначе >80GB
-  max_seq_len_time: 625     # ceil(160000 / 256) = 625 кадров с center=True
+  max_seq_len_time: 626     # floor(160000 / 256) + 1 при torch.stft(center=True)
   max_seq_len_freq: 257     # F = n_fft//2+1 = 512//2+1
 
 model:
@@ -28,5 +28,5 @@ model:
 #   COLA: hop=256 = win/2=256  ✓  (Hann окно, корректный ISTFT)
 #   F = 512//2+1 = 257
 #   T = 160000 сэмплов (10 сек)
-#   N = (160000 - 512) // 256 + 1 = 624 кадра
-#   Память: B=8, F=257, L=624, is_linear=True -> ~35 GB ✓
+#   N = floor(160000 / 256) + 1 = 626 кадров при center=True
+#   Память: B=8, F=257, L=626, is_linear=True -> ~35 GB ✓

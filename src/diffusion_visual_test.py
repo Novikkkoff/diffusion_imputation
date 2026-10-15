@@ -18,15 +18,22 @@ from main_model import CSDI_Physio
 from utils import recon_ri_to_wav
 
 
-DEFAULT_CLEAN_DIR = "/home/ubuntu/projects/ia.novikov/CSDIweather/CSDI/train/clean_signals"
-DEFAULT_LOSSY_DIR = "/home/ubuntu/projects/ia.novikov/CSDIweather/CSDI/train/lossy_signals"
-DEFAULT_TRACES_DIR = "/home/ubuntu/projects/ia.novikov/CSDIweather/CSDI/train/traces"
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = (
+    SOURCE_DIR
+    if os.path.isdir(os.path.join(SOURCE_DIR, "config"))
+    else os.path.dirname(SOURCE_DIR)
+)
+DEFAULT_CLEAN_DIR = os.path.join(PROJECT_DIR, "train", "clean_signals")
+DEFAULT_LOSSY_DIR = os.path.join(PROJECT_DIR, "train", "lossy_signals")
+DEFAULT_TRACES_DIR = os.path.join(PROJECT_DIR, "train", "traces")
 
 SR = 16000
 N_FFT = 512
 HOP_LENGTH = 256
 WIN_LENGTH = 512
-L_FRAMES = 625
+WAV_LENGTH = 160000
+L_FRAMES = WAV_LENGTH // HOP_LENGTH + 1
 TARGET_DIM = N_FFT // 2 + 1
 
 
@@ -231,14 +238,65 @@ def save_holes_animation(path_base, frame_items, clean_ri, lossy_ri, mask, title
 
 
 def load_config(path):
-    candidate = os.path.join("config", path)
-    if os.path.exists(candidate):
-        path = candidate
+    if not os.path.isabs(path) and not os.path.exists(path):
+        path = os.path.join(PROJECT_DIR, "config", path)
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def build_loader(args, config):
+def resolve_checkpoint_path(value):
+    if not value:
+        return ""
+    path = os.path.abspath(os.path.expanduser(value))
+    if os.path.isdir(path):
+        candidates = ["model_best.pth", "model.pth", "model_epoch_300.pth"]
+        for name in candidates:
+            candidate = os.path.join(path, name)
+            if os.path.isfile(candidate):
+                return candidate
+    if os.path.isfile(path):
+        return path
+
+    save_path = os.path.join(PROJECT_DIR, "save", value)
+    if os.path.isdir(save_path):
+        for name in ("model_best.pth", "model.pth", "model_epoch_300.pth"):
+            candidate = os.path.join(save_path, name)
+            if os.path.isfile(candidate):
+                return candidate
+    raise FileNotFoundError(f"Checkpoint not found: {value}")
+
+
+def load_checkpoint_config(checkpoint_path):
+    if not checkpoint_path:
+        return None, None
+    path = os.path.join(os.path.dirname(checkpoint_path), "config.json")
+    if not os.path.isfile(path):
+        return None, None
+    with open(path, "r", encoding="utf-8") as f:
+        saved_config = json.load(f)
+    amp_norm = saved_config.get("audio", {}).get("amp_norm")
+    return saved_config, float(amp_norm) if amp_norm is not None else None
+
+
+def set_amp_norm(loaders, override=None):
+    if override is None:
+        stds = []
+        for i, batch in enumerate(loaders[0]):
+            stds.append(batch["clean_ri"].std().item())
+            if i + 1 >= 50:
+                break
+        if not stds:
+            raise RuntimeError("Cannot estimate amp_norm from an empty training loader")
+        amp_norm = float(np.mean(stds))
+    else:
+        amp_norm = float(override)
+
+    for loader in loaders:
+        loader.dataset.amp_norm = amp_norm
+    return amp_norm
+
+
+def build_loader(args, config, amp_norm_override=None):
     train_loader, valid_loader, test_loader = get_packet_loss_dataloaders(
         clean_dir=args.clean_dir,
         lossy_dir=args.lossy_dir,
@@ -258,14 +316,9 @@ def build_loader(args, config):
     source = {"train": train_loader, "valid": valid_loader, "test": test_loader}[args.split]
     source.dataset.missing_ratio = args.missing_ratio
 
-    stds = []
-    for i, batch in enumerate(train_loader):
-        stds.append(batch["clean_ri"].std().item())
-        if i >= 50:
-            break
-    amp_norm = float(np.mean(stds))
-    for loader in (train_loader, valid_loader, test_loader):
-        loader.dataset.amp_norm = amp_norm
+    amp_norm = set_amp_norm(
+        (train_loader, valid_loader, test_loader), override=amp_norm_override
+    )
 
     return DataLoader(
         Subset(source.dataset, [args.index]),
@@ -284,7 +337,7 @@ def find_local_index_by_item_id(dataset, item_id):
     return None
 
 
-def build_loader_for_item_id(args, config):
+def build_loader_for_item_id(args, config, amp_norm_override=None):
     train_loader, valid_loader, test_loader = get_packet_loss_dataloaders(
         clean_dir=args.clean_dir,
         lossy_dir=args.lossy_dir,
@@ -315,14 +368,9 @@ def build_loader_for_item_id(args, config):
         hint = "; ".join(available) if available else "not found in train/valid/test for this fold/seed"
         raise ValueError(f"item_id={args.item_id!r} not found in split={args.split}. Available: {hint}")
 
-    stds = []
-    for i, batch in enumerate(train_loader):
-        stds.append(batch["clean_ri"].std().item())
-        if i >= 50:
-            break
-    amp_norm = float(np.mean(stds))
-    for loader in (train_loader, valid_loader, test_loader):
-        loader.dataset.amp_norm = amp_norm
+    amp_norm = set_amp_norm(
+        (train_loader, valid_loader, test_loader), override=amp_norm_override
+    )
 
     return DataLoader(
         Subset(source.dataset, [local_idx]),
@@ -343,8 +391,9 @@ def reverse_with_frames(model, observed_data, cond_mask, side_info, keep_steps):
             if model.is_unconditional:
                 diff_input = cond_mask * observed_data + (1.0 - cond_mask) * current_sample
             else:
-                cond_obs = cond_mask * observed_data
-                diff_input = torch.cat([cond_obs, current_sample], dim=1)
+                diff_input = model.set_input_to_diffmodel(
+                    current_sample, observed_data, cond_mask
+                )
 
             predicted = model.diffmodel(
                 diff_input,
@@ -354,6 +403,14 @@ def reverse_with_frames(model, observed_data, cond_mask, side_info, keep_steps):
             coeff1 = 1.0 / model.alpha_hat[t] ** 0.5
             coeff2 = (1.0 - model.alpha_hat[t]) / (1.0 - model.alpha[t]) ** 0.5
             current_sample = coeff1 * (current_sample - coeff2 * predicted)
+            if t > 0:
+                sigma = (
+                    (1.0 - model.alpha[t - 1])
+                    / (1.0 - model.alpha[t])
+                    * model.beta[t]
+                ) ** 0.5
+                current_sample = current_sample + sigma * torch.randn_like(current_sample)
+            current_sample = current_sample.clamp(-1.5, 1.5)
             current_sample = cond_mask * observed_data + (1.0 - cond_mask) * current_sample
 
             if t in keep_steps:
@@ -372,8 +429,9 @@ def reverse_all_frames(model, observed_data, cond_mask, side_info, stride=1):
             if model.is_unconditional:
                 diff_input = cond_mask * observed_data + (1.0 - cond_mask) * current_sample
             else:
-                cond_obs = cond_mask * observed_data
-                diff_input = torch.cat([cond_obs, current_sample], dim=1)
+                diff_input = model.set_input_to_diffmodel(
+                    current_sample, observed_data, cond_mask
+                )
 
             predicted = model.diffmodel(
                 diff_input,
@@ -383,6 +441,14 @@ def reverse_all_frames(model, observed_data, cond_mask, side_info, stride=1):
             coeff1 = 1.0 / model.alpha_hat[t] ** 0.5
             coeff2 = (1.0 - model.alpha_hat[t]) / (1.0 - model.alpha[t]) ** 0.5
             current_sample = coeff1 * (current_sample - coeff2 * predicted)
+            if t > 0:
+                sigma = (
+                    (1.0 - model.alpha[t - 1])
+                    / (1.0 - model.alpha[t])
+                    * model.beta[t]
+                ) ** 0.5
+                current_sample = current_sample + sigma * torch.randn_like(current_sample)
+            current_sample = current_sample.clamp(-1.5, 1.5)
             current_sample = cond_mask * observed_data + (1.0 - cond_mask) * current_sample
 
             if t % stride == 0 or t == model.num_steps - 1:
@@ -416,33 +482,65 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    config = load_config(args.config)
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        fallback = "mps" if mps_available else "cpu"
+        print(f"Requested device {args.device!r} is unavailable; using {fallback!r}")
+        args.device = fallback
+
+    for directory_arg in ("clean_dir", "lossy_dir", "traces_dir"):
+        value = os.path.abspath(os.path.expanduser(getattr(args, directory_arg)))
+        setattr(args, directory_arg, value)
+        if not os.path.isdir(value):
+            raise FileNotFoundError(f"{directory_arg} does not exist: {value}")
+
+    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
+    saved_config, saved_amp_norm = load_checkpoint_config(checkpoint_path)
+    config = saved_config if saved_config is not None else load_config(args.config)
     config["model"]["is_unconditional"] = False
-    config["diffusion"]["max_seq_len_time"] = L_FRAMES
-    config["diffusion"]["max_seq_len_freq"] = TARGET_DIM
+    config["diffusion"].setdefault("max_seq_len_time", L_FRAMES)
+    config["diffusion"].setdefault("max_seq_len_freq", TARGET_DIM)
 
     visual_name = args.item_id or str(args.index)
-    outdir = args.outdir or os.path.join("save", f"diffusion_visual_{args.split}_{visual_name}")
+    outdir = args.outdir or os.path.join(
+        PROJECT_DIR, "save", f"diffusion_visual_{args.split}_{visual_name}"
+    )
+    outdir = os.path.abspath(os.path.expanduser(outdir))
     os.makedirs(outdir, exist_ok=True)
-    with open(os.path.join(outdir, "visual_config.json"), "w", encoding="utf-8") as f:
-        json.dump({"args": vars(args), "config": config}, f, indent=2)
 
     if args.item_id:
-        loader, amp_norm, local_idx = build_loader_for_item_id(args, config)
+        loader, amp_norm, local_idx = build_loader_for_item_id(
+            args, config, amp_norm_override=saved_amp_norm
+        )
         print(f"Selected item_id={args.item_id} from split={args.split}, local_index={local_idx}")
     else:
-        loader, amp_norm = build_loader(args, config)
+        loader, amp_norm = build_loader(
+            args, config, amp_norm_override=saved_amp_norm
+        )
     batch = next(iter(loader))
 
+    with open(os.path.join(outdir, "visual_config.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "args": vars(args),
+                "checkpoint_path": checkpoint_path,
+                "amp_norm": amp_norm,
+                "config": config,
+            },
+            f,
+            indent=2,
+        )
+
     model = CSDI_Physio(config, args.device, target_dim=TARGET_DIM).to(args.device)
-    if args.checkpoint:
-        ckpt = args.checkpoint
-        if os.path.isdir(ckpt):
-            ckpt = os.path.join(ckpt, "model.pth")
-        elif not os.path.exists(ckpt):
-            ckpt = os.path.join("save", ckpt, "model.pth")
-        print(f"Loading checkpoint: {ckpt}")
-        model.load_state_dict(torch.load(ckpt, map_location=args.device))
+    if checkpoint_path:
+        print(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=args.device)
+        state_dict = (
+            checkpoint["model_state_dict"]
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
+            else checkpoint
+        )
+        model.load_state_dict(state_dict)
     model.eval()
 
     observed_data, clean_data, observed_mask, observed_tp, _, _ = model.process_data(batch)
@@ -471,7 +569,7 @@ def main():
     if "lossy_wav" in batch:
         sf.write(os.path.join(outdir, f"{item_id}_lossy.wav"), batch["lossy_wav"][0].cpu().numpy(), SR)
 
-    forward_dir = os.path.join(outdir, "forward_model_input_noisy_everywhere")
+    forward_dir = os.path.join(outdir, "forward_model_input_noisy_holes")
     forward_composite_dir = os.path.join(outdir, "forward_inpaint_composite_view")
     reverse_dir = os.path.join(outdir, "reverse_denoise")
     holes_forward_dir = os.path.join(outdir, "forward_model_input_holes_only")
@@ -491,7 +589,7 @@ def main():
         tt = torch.full((clean_data.shape[0],), t, device=model.device, dtype=torch.long)
         alpha_t = model.alpha_torch[tt]
         x_t = alpha_t.sqrt() * clean_data + (1.0 - alpha_t).sqrt() * fixed_noise
-        noisy_model_input = x_t
+        noisy_model_input = x_t * (1.0 - cond_mask)
         noisy_composite_view = cond_mask * observed_data + (1.0 - cond_mask) * x_t
         save_triplet(
             os.path.join(forward_dir, f"forward_model_input_t{t:03d}.png"),
@@ -499,7 +597,7 @@ def main():
             lossy_ri,
             noisy_model_input[0].detach().cpu(),
             mask,
-            f"Forward diffusion model input: noisy clean everywhere, t={t}",
+            f"Forward diffusion target channels: noisy holes only, t={t}",
         )
         save_triplet(
             os.path.join(forward_composite_dir, f"forward_composite_t{t:03d}.png"),
@@ -532,7 +630,8 @@ def main():
             alpha_t = model.alpha_torch[tt]
             x_t = alpha_t.sqrt() * clean_data + (1.0 - alpha_t).sqrt() * fixed_noise
             noisy_composite_view = cond_mask * observed_data + (1.0 - cond_mask) * x_t
-            forward_video_frames.append((t, x_t[0].detach().cpu()))
+            noisy_model_input = x_t * (1.0 - cond_mask)
+            forward_video_frames.append((t, noisy_model_input[0].detach().cpu()))
             forward_composite_video_frames.append((t, noisy_composite_view[0].detach().cpu()))
         if forward_video_frames[-1][0] != model.num_steps - 1:
             t = model.num_steps - 1
@@ -540,15 +639,16 @@ def main():
             alpha_t = model.alpha_torch[tt]
             x_t = alpha_t.sqrt() * clean_data + (1.0 - alpha_t).sqrt() * fixed_noise
             noisy_composite_view = cond_mask * observed_data + (1.0 - cond_mask) * x_t
-            forward_video_frames.append((t, x_t[0].detach().cpu()))
+            noisy_model_input = x_t * (1.0 - cond_mask)
+            forward_video_frames.append((t, noisy_model_input[0].detach().cpu()))
             forward_composite_video_frames.append((t, noisy_composite_view[0].detach().cpu()))
         save_animation(
-            os.path.join(outdir, "video_forward_model_input_noisy_everywhere"),
+            os.path.join(outdir, "video_forward_model_input_noisy_holes"),
             forward_video_frames,
             clean_ri,
             lossy_ri,
             mask,
-            f"Forward diffusion model input / noisy clean everywhere: {item_id}",
+            f"Forward diffusion target channels / noisy holes only: {item_id}",
             fps=args.video_fps,
         )
         save_holes_animation(
